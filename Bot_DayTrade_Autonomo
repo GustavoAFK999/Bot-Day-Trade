@@ -1,0 +1,244 @@
+from telegram import Update, ParseMode, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, CallbackContext, CallbackQueryHandler
+from iqoptionapi.stable_api import IQ_Option
+import logging
+import time
+import threading
+import yfinance as yf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from io import BytesIO
+import subprocess
+
+# Configuração do logging
+logging.basicConfig(level=logging.INFO)
+
+# Variáveis globais
+api = IQ_Option("botdaytrade777@gmail.com", "day.trade.bot")
+api.connect()
+
+# Estado do bot
+mode = 'manual'
+current_operations = 0
+max_operations = 5
+max_gales = 3
+current_gales = 0
+valor_investido = 100
+stop_loss = 50
+stop_gain = 100
+operation_duration = 60
+interval_between_operations = 30
+ativos = ['AAPL', 'GOOGL']
+capital_total = 1000
+risk_percentage = 2
+operation_lock = threading.Lock()
+recording_process = None
+recording_stop_conditions = None
+operations_log = []  # Lista para armazenar todas as operações realizadas
+cooldown_duration = 60  # Tempo de cooldown em segundos (ajustável)
+operation_time_limit = 8 * 3600  # Limite de tempo padrão: 8 horas
+start_time = None
+
+# Função para obter dados financeiros em tempo real
+def get_data(symbol):
+    try:
+        df = yf.download(symbol, period='1d', interval='1m')
+        df['SMA_20'] = df['Close'].rolling(window=20).mean()
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        return df
+    except Exception as e:
+        logging.error(f"❌ Erro ao obter dados para {symbol}: {e}")
+        return None
+
+# Função para calcular o RSI
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# Função para analisar os melhores ativos
+def analyze_best_assets():
+    best_assets = []
+    for ativo in ativos:
+        df = get_data(ativo)
+        if df is not None and not df.empty:
+            best_criteria = df['Close'].iloc[-1] > df['SMA_20'].iloc[-1] and df['Close'].iloc[-1] > df['SMA_50'].iloc[-1]
+            if best_criteria:
+                best_assets.append(ativo)
+    return best_assets
+
+# Função para iniciar operações automáticas
+def start_trading_automatico(update: Update, context: CallbackContext):
+    global current_operations, mode, capital_total, current_gales, start_time
+
+    if mode != 'automático':
+        if update.message:
+            update.message.reply_text("⚠️ O bot não está no modo automático.")
+        return
+
+    start_time = time.time()
+
+    while time.time() - start_time < operation_time_limit:
+        with operation_lock:
+            if current_operations >= max_operations:
+                if update.message:
+                    update.message.reply_text(f"⚠️ Limite máximo de operações simultâneas atingido ({max_operations}).")
+                break
+
+            best_assets = analyze_best_assets()
+            if not best_assets:
+                if update.message:
+                    update.message.reply_text("❌ Nenhum ativo encontrado para operação.")
+                break
+
+            for ativo in best_assets:
+                logging.info(f"📈 Iniciando operação automática para {ativo}")
+
+                quantity = 1
+                entry_price = api.get_price(ativo)
+                time.sleep(operation_duration)
+                exit_price = api.get_price(ativo)
+
+                profit = (exit_price - entry_price) * quantity
+
+                capital_total += profit
+                if capital_total <= stop_loss:
+                    mode = 'manual'
+                    update.message.reply_text("⚠️ Stop Loss atingido. Operações automáticas interrompidas.")
+                    return
+                elif capital_total >= stop_gain:
+                    mode = 'manual'
+                    update.message.reply_text("✅ Stop Gain atingido. Operações automáticas interrompidas.")
+                    return
+
+                operations_log.append({
+                    'ativo': ativo,
+                    'quantidade': quantity,
+                    'preco_entrada': entry_price,
+                    'preco_saida': exit_price,
+                    'lucro': profit
+                })
+
+                current_operations += 1
+                time.sleep(interval_between_operations)
+
+            if time.time() - start_time >= operation_time_limit:
+                if update.message:
+                    update.message.reply_text("⏳ Limite de tempo atingido. Operações automáticas interrompidas.")
+                mode = 'manual'
+                break
+
+            if current_operations < max_operations and mode == 'automático':
+                update.message.reply_text(f"🔄 Cooldown de {cooldown_duration} segundos antes de reiniciar as operações.")
+                time.sleep(cooldown_duration)
+
+        if update.message:
+            update.message.reply_text("✅ Operações automáticas iniciadas novamente.")
+
+def stop_trading_automatico(update: Update, context: CallbackContext):
+    global mode
+    mode = 'manual'
+    update.message.reply_text("⏹️ Operações automáticas interrompidas manualmente.")
+
+# Função para definir o intervalo entre operações
+def set_interval(update: Update, context: CallbackContext):
+    global interval_between_operations
+
+    try:
+        new_interval = int(context.args[0])
+        if new_interval <= 0:
+            raise ValueError("O intervalo deve ser um valor positivo.")
+
+        interval_between_operations = new_interval
+        update.message.reply_text(f"✅ Intervalo entre operações definido para {new_interval} segundos.")
+    except (IndexError, ValueError):
+        update.message.reply_text("❌ Uso incorreto. Utilize o comando /set_interval <tempo_em_segundos>.")
+
+# Função para definir o limite de tempo da operação
+def set_time_limit(update: Update, context: CallbackContext):
+    global operation_time_limit
+
+    try:
+        if '/' in context.args[0]:
+            hours, minutes = map(int, context.args[0].split('/'))
+            new_time_limit = (hours * 3600) + (minutes * 60)
+        else:
+            new_time_limit = int(context.args[0]) * 60  # Converte minutos para segundos
+
+        if new_time_limit <= 0:
+            raise ValueError("O limite de tempo deve ser um valor positivo.")
+
+        operation_time_limit = new_time_limit
+        update.message.reply_text(f"✅ Limite de tempo definido para {context.args[0]} minutos.")
+    except (IndexError, ValueError):
+        update.message.reply_text("❌ Uso incorreto. Utilize o comando /set_time_limit <tempo_em_minutos> ou <tempo_em_horas/minutos>.")
+
+# Função para gerar gráfico de preço e RSI
+def plot_graph(symbol):
+    df = get_data(symbol)
+    if df is None or df.empty:
+        return None
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # Gráfico de preço
+    fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='Preço'), secondary_y=False)
+
+    # Médias Móveis
+    if 'SMA_20' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['SMA_20'], mode='lines', name='SMA 20'), secondary_y=False)
+    if 'SMA_50' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], mode='lines', name='SMA 50'), secondary_y=True)
+
+    # Gráfico RSI
+    rsi = compute_rsi(df['Close'])
+    if not rsi.empty:
+        fig.add_trace(go.Scatter(x=df.index, y=rsi, mode='lines', name='RSI'), secondary_y=False)
+
+    fig.update_layout(title=f'📊 Gráficos de {symbol}', xaxis_title='Data', yaxis_title='Preço', yaxis2_title='RSI', template='plotly_dark')
+    return fig
+
+# Função para gerar gráfico de ganhos e perdas
+def plot_profit_loss_graph():
+    if not operations_log:
+        return None
+
+    profits = []
+    times = []
+
+    for operation in operations_log:
+        quantity = operation['quantidade']
+        entry_price = operation['preco_entrada']
+        exit_price = operation['preco_saida']
+        profit = (exit_price - entry_price) * quantity
+        profits.append(profit)
+        times.append(time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime()))
+
+    fig = go.Figure(data=[go.Scatter(x=times, y=profits, mode='lines+markers', name='Lucros/Perdas')])
+
+    fig.update_layout(title='📈 Gráfico de Ganhos e Perdas', xaxis_title='Tempo', yaxis_title='Lucro/Perda', template='plotly_dark')
+    return fig
+
+# Função para iniciar o bot
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text("👋 Olá! O bot está ativo e pronto para operar.")
+
+def main():
+    updater = Updater("7366052156:AAGSEtTaxvs-3RIHwvt0mgSRQKKhpaA3lD8", use_context=True)
+
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("start_trading_automatico", start_trading_automatico))
+    dp.add_handler(CommandHandler("stop_trading_automatico", stop_trading_automatico))
+    dp.add_handler(CommandHandler("set_interval", set_interval))
+    dp.add_handler(CommandHandler("set_time_limit", set_time_limit))
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
